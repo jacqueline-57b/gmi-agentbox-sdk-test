@@ -80,14 +80,19 @@ def main() -> int:
         print("GMI_AGENTBOX_API_KEY is not set — nothing to do")
         return 0
 
-    from agentbox_sdk import AgentBoxClient, APIError
+    from agentbox_sdk import AgentBoxClient, APIError, TransportError
 
     client = AgentBoxClient()
     failures: List[str] = []
 
-    agents = [
-        agent for agent in list_all(client.agents.list) if agent.slug.startswith(prefixes)
-    ]
+    try:
+        listed = list_all(client.agents.list)
+    except TransportError as exc:
+        # Nothing was checked, so nothing can be claimed clean. Say which host
+        # went quiet rather than unwinding a urllib traceback over it.
+        print(f"::error::cannot reach {client.base_url} — {exc}")
+        return 1
+    agents = [agent for agent in listed if agent.slug.startswith(prefixes)]
     if not agents:
         print(f"no agents matching {prefixes} — account is clean")
         return 0
@@ -111,6 +116,8 @@ def main() -> int:
                 try:
                     target.delete()
                     print(f"  deleted {describe(target)}")
+                except TransportError as exc:
+                    failures.append(f"{describe(target)}: unreachable — {exc}")
                 except APIError as exc:
                     if exc.status_code == 404:
                         continue
@@ -134,7 +141,7 @@ def main() -> int:
     for agent in agents:
         try:
             found = list_all(client.sandboxes.list, agent_id=agent.id)
-        except APIError as exc:
+        except (APIError, TransportError) as exc:
             failures.append(f"list sandboxes of {agent.slug}: {exc}")
             continue
         owned.extend((agent, sandbox) for sandbox in found)

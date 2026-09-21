@@ -8,3 +8,4 @@ allure-report/
 
 # macOS
 .DS_Store
+.vscode

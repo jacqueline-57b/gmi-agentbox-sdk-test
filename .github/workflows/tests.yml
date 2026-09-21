@@ -142,6 +142,13 @@ jobs:
           # Names only. The key's value never reaches the log.
           echo "wrote .env with: $(cut -d= -f1 .env | tr '\n' ' ')"
 
+      # An unreachable base URL is invisible in the test output: every case
+      # dies in fixture setup with the same urllib traceback and the cleanup
+      # step dies the same way 30s later, none of them naming the host. Ask
+      # once, up front, and say so in one line.
+      - name: Check the API is reachable
+        run: python scripts/preflight.py
+
       # Inputs arrive through env, never interpolated into the script: a -k
       # expression is free text, and ${{ }} inside a run block would put it
       # straight into the shell.
