@@ -1,0 +1,257 @@
+name: AgentBox SDK Test
+
+# Every case in this suite talks to the real AgentBox API and the `billable`
+# ones launch a real sandbox, so this never runs on a push or a pull request.
+# It runs on a schedule and on demand, one run at a time per environment.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Which account to test against
+        type: choice
+        default: dev
+        options:
+          - dev
+          - prod
+      scope:
+        description: Which cases to run
+        type: choice
+        default: the whole suite
+        options:
+          - the whole suite
+          - B-0 agent registration
+      filter:
+        description: 'Narrow it to one case with a -k expression, e.g. t01 or "t01 or t03"'
+        type: string
+        required: false
+        default: ""
+      include_billable:
+        description: Allow cases that launch a sandbox (this costs money)
+        type: boolean
+        default: false
+  schedule:
+    # 18:00 UTC = 02:00 the next day in UTC+8. Scheduled runs take every
+    # default below: dev, whole suite, nothing billable.
+    - cron: "0 18 * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One live run per environment. dev and prod are separate accounts with
+# separate quotas, so they may overlap; two runs against the same one may not.
+# Deliberately not cancel-in-progress — killing a run mid-flight strands
+# sandboxes that keep billing.
+concurrency:
+  group: live-tests-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  ALLURE_RESULTS: allure-results
+  ALLURE_REPORT: allure-report
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # A hung run holds sandboxes open, so bound it.
+    timeout-minutes: 60
+    # Resolves GMI_AGENTBOX_API_KEY and GMI_AGENTBOX_BASE_URL from the GitHub
+    # Environment of the same name, so dev and prod can hold different
+    # credentials. Falls back to the repository-level secret if no such
+    # environment exists yet.
+    environment:
+      name: ${{ inputs.environment || 'dev' }}
+    outputs:
+      tests_passed: ${{ steps.pytest.outputs.passed }}
+      report_ready: ${{ steps.report.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install the Allure CLI
+        run: |
+          npm install -g allure-commandline
+          allure --version
+
+      # Trend graphs only exist if the previous report's history/ is fed back
+      # in, and dev and prod must not share a trend line — hence the
+      # environment in the key. restore-keys picks the most recent entry for
+      # this environment.
+      - name: Restore Allure history
+        uses: actions/cache/restore@v4
+        with:
+          path: allure-history
+          key: allure-history-${{ inputs.environment || 'dev' }}-${{ github.run_id }}
+          restore-keys: allure-history-${{ inputs.environment || 'dev' }}-
+
+      - name: Seed the results directory with that history
+        run: |
+          mkdir -p "$ALLURE_RESULTS"
+          if [ -d allure-history ]; then
+            mkdir -p "$ALLURE_RESULTS/history"
+            cp -r allure-history/. "$ALLURE_RESULTS/history/"
+            echo "carried forward $(ls -1 "$ALLURE_RESULTS/history" | wc -l) history file(s)"
+          else
+            echo "no previous history for this environment — this report starts the trend"
+          fi
+
+      # The suite, the cleanup script and the Allure stamper each load .env
+      # themselves, exactly as they do on a developer's machine, so the runner
+      # gets one too and no later step has to carry the secret.
+      #
+      # Only these two are configured; the data center, the SKU and the base
+      # image are left to the fixtures to discover.
+      - name: Write .env from the environment's secret
+        env:
+          GMI_AGENTBOX_API_KEY: ${{ secrets.GMI_AGENTBOX_API_KEY }}
+          GMI_AGENTBOX_BASE_URL: ${{ vars.GMI_AGENTBOX_BASE_URL }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+        run: |
+          # Without a key every case skips itself, pytest exits 0, and the run
+          # reports green having tested nothing. Refuse to start instead.
+          if [ -z "$GMI_AGENTBOX_API_KEY" ]; then
+            echo "::error::GMI_AGENTBOX_API_KEY is not set for the '$TARGET_ENVIRONMENT' environment"
+            echo "Set it under Settings -> Environments -> $TARGET_ENVIRONMENT -> Secrets,"
+            echo "or as a repository secret. Every case skips without it."
+            exit 1
+          fi
+          umask 077
+          printf 'GMI_AGENTBOX_API_KEY=%s\n' "$GMI_AGENTBOX_API_KEY" > .env
+          # Written only when it has a value: the SDK reads it with
+          # os.getenv(name, default), so an empty one beats the default and
+          # leaves the client with no base URL at all. prod wants it unset.
+          if [ -n "$GMI_AGENTBOX_BASE_URL" ]; then
+            printf 'GMI_AGENTBOX_BASE_URL=%s\n' "$GMI_AGENTBOX_BASE_URL" >> .env
+          fi
+          # Names only. The key's value never reaches the log.
+          echo "wrote .env with: $(cut -d= -f1 .env | tr '\n' ' ')"
+
+      # Inputs arrive through env, never interpolated into the script: a -k
+      # expression is free text, and ${{ }} inside a run block would put it
+      # straight into the shell.
+      - name: Work out what to run
+        id: plan
+        env:
+          SCOPE: ${{ inputs.scope || 'the whole suite' }}
+          FILTER: ${{ inputs.filter }}
+          INCLUDE_BILLABLE: ${{ inputs.include_billable }}
+        run: |
+          # One line per suite. Add the next file here and to the `scope`
+          # options above; everything else in the workflow stays as it is.
+          case "$SCOPE" in
+            "B-0 agent registration") target=tests/test_b0_agent_registration.py ;;
+            *)                        target="" ;;
+          esac
+          {
+            echo "target=$target"
+            echo "billable=$INCLUDE_BILLABLE"
+          } >> "$GITHUB_OUTPUT"
+          echo "scope            : $SCOPE${target:+  ->  $target}"
+          echo "filter (-k)      : ${FILTER:-<none>}"
+          echo "billable allowed : $INCLUDE_BILLABLE"
+          if [ "$INCLUDE_BILLABLE" = "true" ]; then
+            echo "::warning::billable cases are enabled — this run launches real sandboxes"
+          fi
+
+      - name: Run the suite
+        id: pytest
+        env:
+          TARGET: ${{ steps.plan.outputs.target }}
+          FILTER: ${{ inputs.filter }}
+          INCLUDE_BILLABLE: ${{ steps.plan.outputs.billable }}
+        run: |
+          args=( -ra --alluredir="$ALLURE_RESULTS" )
+          if [ -n "$TARGET" ]; then args+=( "$TARGET" ); fi
+          if [ "$INCLUDE_BILLABLE" != "true" ]; then args+=( -m "not billable" ); fi
+          if [ -n "$FILTER" ]; then args+=( -k "$FILTER" ); fi
+
+          printf 'pytest'; printf ' %q' "${args[@]}"; printf '\n'
+          set +e
+          pytest "${args[@]}"
+          code=$?
+          set -e
+          # 5 is "no tests collected" — a filter that matched nothing is a
+          # mistake worth surfacing, not a green run.
+          echo "passed=$([ $code -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "exit code $code"
+
+      # Belt and braces: the tracker deletes what it created, but only if the
+      # process reached teardown. A timeout or a cancel skips that.
+      - name: Delete anything left behind
+        if: always()
+        run: python scripts/cleanup_leftovers.py
+
+      - name: Stamp the environment panel
+        if: always()
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+        run: |
+          python allure/stamp_env.py "$ALLURE_RESULTS"
+          {
+            echo "Target.Account=$TARGET_ENVIRONMENT"
+            echo "Scope=${{ steps.plan.outputs.target != '' && steps.plan.outputs.target || 'the whole suite' }}"
+            echo "Billable.Cases=${{ steps.plan.outputs.billable }}"
+          } >> "$ALLURE_RESULTS/environment.properties"
+
+      - name: Generate the report
+        id: report
+        if: always()
+        run: |
+          allure generate "$ALLURE_RESULTS" -o "$ALLURE_REPORT" --clean
+          rm -rf allure-history
+          cp -r "$ALLURE_REPORT/history" allure-history
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save Allure history for the next run
+        if: always() && steps.report.outputs.ready == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: allure-history
+          key: allure-history-${{ inputs.environment || 'dev' }}-${{ github.run_id }}
+
+      - name: Upload the report as a Pages artifact
+        if: always() && steps.report.outputs.ready == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.ALLURE_REPORT }}
+
+      # Ephemeral on a hosted runner, but a self-hosted one keeps its
+      # workspace between jobs.
+      - name: Shred .env
+        if: always()
+        run: rm -f .env
+
+      # Last, so the report is published either way but a red suite still
+      # shows red.
+      - name: Fail if any case failed
+        if: always() && steps.pytest.outputs.passed != 'true'
+        run: |
+          echo "::error::the suite reported failures — see the Allure report"
+          exit 1
+
+  deploy:
+    needs: test
+    if: always() && needs.test.outputs.report_ready == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

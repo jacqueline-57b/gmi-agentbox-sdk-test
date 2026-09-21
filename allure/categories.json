@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Live: missing API key",
+    "messageRegex": ".*GMI_AGENTBOX_API_KEY is not set.*",
+    "matchedStatuses": ["skipped"]
+  },
+  {
+    "name": "Live: no capacity for this org",
+    "messageRegex": ".*(no sandbox data centers|no sandbox SKU is available).*",
+    "matchedStatuses": ["skipped"]
+  },
+  {
+    "name": "API contract mismatch",
+    "matchedStatuses": ["failed"]
+  },
+  {
+    "name": "Infrastructure / transport error",
+    "matchedStatuses": ["broken"]
+  }
+]

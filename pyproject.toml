@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["tests"]
+# importlib import mode: test files need no __init__.py, and two directories
+# may both hold a test_errors.py without colliding once the suite grows.
+addopts = "-ra --strict-markers --strict-config --import-mode=importlib"
+markers = [
+    "slow: takes minutes (image builds, sandbox boot)",
+    "billable: launches a sandbox, which bills the Console account",
+]

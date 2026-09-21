@@ -1,0 +1,8 @@
+# Runtime dependency under test
+gmi-agentbox-sdk>=0.1.0b2
+
+# Test framework
+pytest>=8.0
+
+# Allure reporting
+allure-pytest>=2.16
