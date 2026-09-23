@@ -15,15 +15,16 @@ base_url=os.getenv("GMI_AGENTBOX_BASE_URL")  # unset -> SDK falls back to DEFAUL
 client = AgentBoxClient(api_key=api_key, base_url=base_url)
 instance_type = "gmi.sandbox.x-small"
 
-agent = client.agents.get("agentbox-demo")
+# agent = client.agents.get("agentbox-demo")
+agent = client.agents.get("agentbox-demo-with-start-cmd-2")
 
-# sandbox = agent.launch(instance_type=instance_type)
-# # or: client.sandboxes.launch(agent.slug, instance_type=..., idc_name=agent.idc)
+sandbox = agent.launch(instance_type=instance_type)
+# or: client.sandboxes.launch(agent.slug, instance_type=..., idc_name=agent.idc)
 
-# sandbox.wait_until_running(timeout=300, poll_interval=2.0)
-# sandbox.refresh()
-# print(sandbox.status, sandbox.last_error, sandbox.endpoint_url)
-# print(sandbox.expires_at)
+sandbox.wait_until_running(timeout=300, poll_interval=2.0)
+sandbox.refresh()
+print(sandbox.status, sandbox.last_error, sandbox.endpoint_url)
+print(sandbox.expires_at)
 
 sandbox_list = client.sandboxes.list(status="terminated");
 

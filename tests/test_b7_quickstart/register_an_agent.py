@@ -33,11 +33,11 @@ instance_type = "gmi.sandbox.x-small"
 # )
 
 agent = client.agents.create(
-    title="agentbox-demo",  # choose a unique name
+    title="agentbox-demo-with-start-cmd-2",  # choose a unique name
     image_url="node:20-alpine",
     idc=idc_id,
     instance_type=instance_type,
     runtime="sandbox",
-    # start_cmd="sleep infinity",
+    start_cmd="sleep infinity",
 )
 print(agent.slug, agent.launchable, agent.title)

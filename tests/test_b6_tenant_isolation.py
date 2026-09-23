@@ -225,6 +225,11 @@ def other_org_client(test_client: AgentBoxClient) -> AgentBoxClient:
     organization's agents would make every "does not exist" in I-01 vacuous,
     so the fixture refuses to hand one over rather than let the row pass for
     the wrong reason.
+
+    Identity is compared by agent id, never by name: every organization may
+    hold an agent called `agentbox-demo`, so a shared slug means nothing. The
+    same agent seen by both keys carries the same id, which is the overlap
+    this looks for.
     """
     key = os.getenv(OTHER_ORG_OWNER_ENV) or os.getenv(OTHER_ORG_FALLBACK_ENV)
     if not key:
@@ -236,13 +241,13 @@ def other_org_client(test_client: AgentBoxClient) -> AgentBoxClient:
         pytest.skip(f"{OTHER_ORG_OWNER_ENV} holds the same key as GMI_AGENTBOX_API_KEY")
 
     other = AgentBoxClient(api_key=key)
-    mine = {agent.slug for agent in test_client.agents.list(page_size=50).items}
-    theirs = {agent.slug for agent in other.agents.list(page_size=50).items}
+    mine = {agent.id for agent in test_client.agents.list(page_size=50).items}
+    theirs = {agent.id for agent in other.agents.list(page_size=50).items}
     shared = mine & theirs
     if shared:
         pytest.skip(
             f"the second key can already see {len(shared)} of this organization's agents "
-            f"({sorted(shared)[:3]}), so it is not a separate tenant and cannot prove isolation"
+            f"(ids {sorted(shared)[:3]}), so it is not a separate tenant and cannot prove isolation"
         )
     return other
 
@@ -483,16 +488,16 @@ def test_i01_another_organization_cannot_see_or_touch_the_sandbox(
             method="other_org_client.sandboxes.list(), other_org_client.agents.list()",
             returns={
                 "sandboxes B sees": [item.id for item in theirs.items],
-                "agents B sees": [item.slug for item in their_agents.items],
+                "agents B sees": [f"{item.slug} ({item.id})" for item in their_agents.items],
                 "A's sandbox is among them": sandbox.id in {item.id for item in theirs.items},
-                "A's agent is among them": session_agent.slug
-                in {item.slug for item in their_agents.items},
+                "A's agent is among them": session_agent.id
+                in {item.id for item in their_agents.items},
             },
         )
         assert sandbox.id not in {item.id for item in theirs.items}, (
             "A's sandbox appears in another organization's list"
         )
-        assert session_agent.slug not in {item.slug for item in their_agents.items}, (
+        assert session_agent.id not in {item.id for item in their_agents.items}, (
             "A's agent appears in another organization's list"
         )
 
@@ -537,7 +542,6 @@ def test_i01_another_organization_cannot_see_or_touch_the_sandbox(
 @allure.story("I-02 a colleague in the same organization reads but cannot write")
 @allure.severity(P1)
 @pytest.mark.slow
-@pytest.mark.billable
 def test_i02_a_colleague_reads_but_cannot_write(
     other_org_client, colleague_client, second_org_sandbox
 ):
@@ -547,14 +551,17 @@ def test_i02_a_colleague_reads_but_cannot_write(
     colleague = bound_to(colleague_client, sandbox.id)
 
     with allure.step("1. the two credentials really are in one organization"):
-        theirs = {item.slug for item in colleague_client.agents.list(page_size=50).items}
-        shares = agent.slug in theirs
+        their_agents = colleague_client.agents.list(page_size=50).items
+        theirs = {item.id for item in their_agents}
+        shares = agent.id in theirs
         show(
             "what the colleague can enumerate",
             method="colleague_client.agents.list()",
-            args={"the agent the owner created": agent.slug},
+            args={"the agent the owner created": f"{agent.slug} ({agent.id})"},
             returns={
-                "agents the colleague sees": sorted(theirs),
+                "agents the colleague sees": [
+                    f"{item.slug} ({item.id})" for item in their_agents
+                ],
                 "the owner's agent is among them": shares,
             },
         )

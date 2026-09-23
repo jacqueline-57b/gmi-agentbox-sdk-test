@@ -105,7 +105,6 @@ def test_u1_onetime_data_task(test_client, tracker, run_id, sandbox_target, inst
                 idc=sandbox_target.idc,
                 instance_type=instance_type,
                 runtime="sandbox",
-                start_cmd="sleep infinity",
             )
         )
         wait_build(agent)

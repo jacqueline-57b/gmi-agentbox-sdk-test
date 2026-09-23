@@ -40,10 +40,10 @@ print(result.status, result.exit_code, result.data.get("stdout"))
 # if execution.accepted:
 #     sandbox.cancel_execution(execution.id)
 
-# # File round trip
-# sandbox.upload_file(path="/home/user/input.txt", file=b"hello\n")
-# download = sandbox.download_file(path="/home/user/input.txt")
-# print(download.filename, download.content)
+# File round trip
+sandbox.upload_file(path="/home/user/test/input.txt", file=b"hello\n")
+download = sandbox.download_file(path="/home/user/input.txt")
+print(download.filename, download.content)
 
 # An interactive shell. The socket speaks JSON frames in BOTH directions:
 # input must be {"type": "stdin", "data": "...\n"} — raw text is dropped with
