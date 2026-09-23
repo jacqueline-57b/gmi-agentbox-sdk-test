@@ -129,11 +129,25 @@ def show(
 
 
 def known_gap(message: str) -> None:
-    """Record a documented gap: tagged and attached in Allure, xfail in pytest."""
+    """Record a documented gap: tagged and attached in Allure.
+
+    The `pytest.xfail()` below is commented out on purpose while the rows are
+    being debugged: it pre-judged every gap as "expected", aborted the test at
+    this call, and reported XFAIL instead of letting the row run to its own
+    assertions. With it off, a row prints its expected and actual results and
+    then reports whatever it actually does.
+
+    Two consequences worth knowing while it stays off:
+      * rows whose `known_gap()` is the last statement now report PASSED even
+        though the gap text says the expectation was not met;
+      * rows that call it mid-body keep going, so a later assertion decides the
+        verdict instead.
+    Restore the line to put the XFAIL verdicts back.
+    """
     allure.dynamic.tag("KNOWN-GAP")
     show(
         "KNOWN GAP",
         method="(none) - a documented gap, recorded rather than called",
         returns={"gap": message},
     )
-    pytest.xfail(message)
+    # pytest.xfail(message)

@@ -1,8 +1,13 @@
-# Runtime dependency under test
-gmi-agentbox-sdk>=0.1.0b2
+# Runtime dependency under test. Pinned: every "measured against the live
+# service" note in docs/ is about this exact version, and a newer release
+# changes the behaviour the suite asserts on.
+gmi-agentbox-sdk==0.1.0b2
 
 # Test framework
 pytest>=8.0
 
 # Allure reporting
 allure-pytest>=2.16
+
+# Spreadsheet export (scripts/export_report.py)
+openpyxl>=3.1

@@ -10,10 +10,18 @@ against the live service and the twelve cases marked `billable` launch a real
 sandbox. Deselect them with `-m "not billable"` when you do not want the bill.
 Without GMI_AGENTBOX_API_KEY the whole suite skips itself.
 
-Every resource is registered with the session `ResourceTracker`, which deletes
-sandboxes first and agents second at the end of the run — including after a
-failure or a KeyboardInterrupt. Sandboxes bill the Console account until they
-are deleted, so nothing here creates a resource it does not track.
+Every resource is registered with a `ResourceTracker`, which deletes sandboxes
+first and agents second — including after a failure or a KeyboardInterrupt.
+Sandboxes bill the Console account until they are deleted, so nothing here
+creates a resource it does not track.
+
+A row deletes what it created, at the end of that row: `tracker` is
+function-scoped. The org caps concurrent sandboxes per instance type (five, in
+this account), so holding every row's resources until the end of the session
+makes a later row fail to launch because an earlier one is still up. The
+`session_agent` and `session_sandbox` fixtures are the deliberate exception —
+they exist to be shared and are tracked by `session_tracker`, which cleans up
+once, at the end.
 """
 
 from __future__ import annotations
@@ -22,34 +30,17 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Tuple
 
 import pytest
 from agentbox_sdk import Agent, AgentBoxClient, APIError, Sandbox
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# The loader lives in helpers/ because quickstart.py is run outside pytest and
+# needs the same `.env`; see helpers/env.py.
+from helpers.env import load_dotenv  # noqa: E402
 
-
-def _load_dotenv() -> None:
-    """Load PROJECT_ROOT/.env without pulling in python-dotenv.
-
-    Existing environment variables win, so `GMI_AGENTBOX_API_KEY=... pytest`
-    still overrides the file.
-    """
-    env_file = PROJECT_ROOT / ".env"
-    if not env_file.exists():
-        return
-    for raw in env_file.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
-
-
-_load_dotenv()
+load_dotenv()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -231,11 +222,8 @@ def run_id() -> str:
     return f"{time.strftime('%m%d-%H%M')}-{uuid.uuid4().hex[:4]}"
 
 
-@pytest.fixture(scope="session")
-def tracker(request: pytest.FixtureRequest, test_client: AgentBoxClient):
-    tracker = ResourceTracker(test_client)
-    yield tracker
-
+def _teardown(tracker: ResourceTracker, request: pytest.FixtureRequest) -> None:
+    """Delete what a tracker holds, and say what could not be deleted."""
     reporter = request.config.pluginmanager.get_plugin("terminalreporter")
 
     def report(message: str) -> None:
@@ -249,6 +237,37 @@ def tracker(request: pytest.FixtureRequest, test_client: AgentBoxClient):
 
     for failure in tracker.cleanup():
         report(f"[CLEANUP FAILED — delete by hand] {failure}")
+
+
+@pytest.fixture
+def tracker(request: pytest.FixtureRequest, test_client: AgentBoxClient):
+    """Per-test: whatever a row creates, that row deletes when it ends.
+
+    Function-scoped on purpose. Holding a row's agents and sandboxes until the
+    end of the session stacks them up against the org's concurrency quota —
+    five sandboxes per instance type in this account — so a later row is
+    refused a launch because an earlier row's resources are still up. Deleting
+    at the end of each row keeps the peak at what one row actually needs, and
+    stops a long run from billing for sandboxes nothing is using any more.
+
+    The two session fixtures below are the deliberate exception: they exist to
+    be shared, so they are tracked by `session_tracker` instead.
+    """
+    tracker = ResourceTracker(test_client)
+    yield tracker
+    _teardown(tracker, request)
+
+
+@pytest.fixture(scope="session")
+def session_tracker(request: pytest.FixtureRequest, test_client: AgentBoxClient):
+    """Session-lived resources: the shared agent and the shared sandbox.
+
+    These are shared precisely so their cost is paid once — deleting them per
+    row would rebuild an image and boot a sandbox for every test that uses one.
+    """
+    tracker = ResourceTracker(test_client)
+    yield tracker
+    _teardown(tracker, request)
 
 
 @pytest.fixture(scope="session")
@@ -299,12 +318,12 @@ def instance_type(test_client: AgentBoxClient, sandbox_target: SandboxTarget) ->
 def session_agent(
     test_client: AgentBoxClient,
     run_id: str,
-    tracker: ResourceTracker,
+    session_tracker: ResourceTracker,
     sandbox_target: SandboxTarget,
     image_url: str,
 ) -> Agent:
     """One agent shared by the session; its image builds once."""
-    agent = tracker.track_agent(
+    agent = session_tracker.track_agent(
         test_client.agents.create(
             title=f"sdk-test-{run_id}",
             image_url=image_url,
@@ -318,12 +337,12 @@ def session_agent(
 
 @pytest.fixture(scope="session")
 def session_sandbox(
-    session_agent: Agent, tracker: ResourceTracker, instance_type: str
+    session_agent: Agent, session_tracker: ResourceTracker, instance_type: str
 ) -> Sandbox:
     """One running sandbox shared by the session — the expensive resource."""
     if not session_agent.launchable:
         pytest.skip(f"agent {session_agent.slug} is not launchable (upstream template missing)")
 
-    sandbox = tracker.track_sandbox(session_agent.launch(instance_type=instance_type))
+    sandbox = session_tracker.track_sandbox(session_agent.launch(instance_type=instance_type))
     sandbox.wait_until_running(timeout=SANDBOX_RUN_TIMEOUT)
     return sandbox
