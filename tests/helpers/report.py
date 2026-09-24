@@ -99,21 +99,26 @@ def show(
 ) -> None:
     """Print one SDK call and attach it to the Allure report.
 
-    Every label names the SDK layer, because that is the layer these cases
-    drive: `CALL` is the method the step invoked, `ARGS` the arguments it was
-    given, `RETURNS` the object (or the raised error) it handed back. The
-    endpoint each call turns into is deliberately absent — no test here sends
-    a request itself, so printing one would be a hand-written claim rather
-    than something the run observed. Use `--log-http` when the wire is what
-    you need; those transports report what actually went out.
+    `title` names the call and heads both the printed block and the Allure
+    attachment. Under it, `ARGS` is what the step passed and `RETURNS` is the
+    object — or the raised error — it got back. The endpoint each call turns
+    into is deliberately absent: no test here sends a request itself, so
+    printing one would be a hand-written claim rather than something the run
+    observed. Use `--log-http` when the wire is what you need; those
+    transports report what actually went out.
 
-    A step that calls nothing still says so: pass `method="(none) - ..."`.
+    `method` is still accepted and no longer rendered. It used to print as a
+    `CALL` line directly under the title, which in almost every row restated
+    the title with the arguments elided — `client.idcs.list(runtime='sandbox')`
+    followed by `CALL test_client.idcs.list(runtime=...)` — so every
+    attachment opened by saying the same thing twice. The spreadsheet export
+    reads each step's call from the attachment title instead (`_sdk_call` in
+    scripts/export_report.py, which still honours the old `CALL` line in
+    results recorded before this change). The parameter stays because about
+    two hundred call sites pass it; new rows need not.
     """
     rule = "-" * 78
-    lines = [rule, title]
-    if method:
-        lines.append(f"CALL     {method}")
-    lines.append(rule)
+    lines = [rule, title, rule]
     for label, value in (("ARGS    >>", args), ("RETURNS <<", returns)):
         if value is None:
             continue

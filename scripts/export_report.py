@@ -119,12 +119,19 @@ def _attachment_text(results_dir: Path, attachment: Dict[str, Any]) -> str:
         return ""
 
 
-def _sdk_call(text: str) -> str:
-    """The `CALL ...` line show() wrote, which names the SDK method invoked."""
+def _sdk_call(attachment: Dict[str, Any], text: str) -> str:
+    """The call an attachment records.
+
+    `show()` names every attachment after the call it made, and that name is
+    now the only place the call appears — the body carries the title, then
+    ARGS and RETURNS. Results recorded before that change still carry a
+    `CALL ...` line, so it is preferred when present and the name is the
+    fallback; either way a step keeps its `SDK:` label in the sheet.
+    """
     for line in text.splitlines():
         if line.startswith("CALL "):
             return line[len("CALL ") :].strip()
-    return ""
+    return str(attachment.get("name") or "").strip()
 
 
 def _returns_block(text: str) -> str:
@@ -220,8 +227,13 @@ def _case(results_dir: Path, result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _step(results_dir: Path, index: int, step: Dict[str, Any]) -> Dict[str, Any]:
-    texts = [_attachment_text(results_dir, att) for att in step.get("attachments") or []]
-    calls = [call for call in (_sdk_call(text) for text in texts) if call]
+    attachments = step.get("attachments") or []
+    texts = [_attachment_text(results_dir, att) for att in attachments]
+    calls = [
+        call
+        for call in (_sdk_call(att, text) for att, text in zip(attachments, texts))
+        if call
+    ]
     returns = [block for block in (_returns_block(text) for text in texts) if block]
     return {
         "index": index,

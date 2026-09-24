@@ -30,17 +30,22 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, List, Mapping, Tuple
 
 import pytest
-from agentbox_sdk import Agent, AgentBoxClient, APIError, Sandbox
+from agentbox_sdk import Agent, AgentBoxClient, APIError, Eligibility, Sandbox
 
 
 # The loader lives in helpers/ because quickstart.py is run outside pytest and
 # needs the same `.env`; see helpers/env.py.
 from helpers.env import load_dotenv  # noqa: E402
+from helpers.user_agent import install as install_user_agent  # noqa: E402
 
 load_dotenv()
+
+# Before any client is built: the SDK sends no User-Agent, and the edge in
+# front of the staging host 403s urllib's default one. See helpers/user_agent.py.
+install_user_agent()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -195,11 +200,14 @@ def test_client(request: pytest.FixtureRequest) -> AgentBoxClient:
     """The SDK client under test, pointed at the real AgentBox API."""
     if not os.getenv("GMI_AGENTBOX_API_KEY"):
         pytest.skip("GMI_AGENTBOX_API_KEY is not set (copy .env.example to .env)")
+
     if not request.config.getoption("--log-http"):
         return AgentBoxClient()
 
     # The SDK logs nothing itself, so --log-http swaps in transports that
     # narrate the traffic. Printed, not logged, so -s is what surfaces it.
+    # These wrap the module-level transports, which `install_user_agent()`
+    # above has already replaced, so the header still goes out.
     from agentbox_sdk._transport import urlopen_stream_transport, urlopen_transport
 
     from helpers.http_log import logging_stream_transport, logging_transport
@@ -208,6 +216,31 @@ def test_client(request: pytest.FixtureRequest) -> AgentBoxClient:
         transport=logging_transport(urlopen_transport, print),
         stream_transport=logging_stream_transport(urlopen_stream_transport, print),
     )
+
+
+@pytest.fixture(scope="session")
+def entitlement(test_client: AgentBoxClient) -> Eligibility:
+    """`eligibility()`, read once for the whole session.
+
+    Two files ask about the same answer — `test_client.py` checks the key is
+    accepted and the runtimes are named, `test_catalog.py` compares the data
+    centers it advertises against `idcs.list` — and it costs a live request on
+    a host where about one in five never returns, so it is read here rather
+    than once per file.
+    """
+    return test_client.eligibility()
+
+
+@pytest.fixture(scope="session")
+def runtimes(entitlement: Eligibility) -> Dict[str, Mapping]:
+    """The runtimes the catalogue advertises, by name.
+
+    `Eligibility` carries `eligible` and `data_centers` as attributes and
+    nothing else, so this comes off `.data`, where the service puts
+    `{"sandbox": {"available": true}, ...}`. `helpers.catalogue.RUNTIMES` is
+    the constant this is checked against, in `test_client.py`.
+    """
+    return dict(entitlement.data.get("runtimes") or {})
 
 
 @pytest.fixture(scope="session")

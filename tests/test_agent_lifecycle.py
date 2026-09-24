@@ -8,7 +8,7 @@ import allure
 import pytest
 from agentbox_sdk import AgentBoxClient, NotFoundError
 
-from helpers.report import show
+from helpers.report import _payload, show
 
 FEATURE = "Agent lifecycle"
 NORMAL = allure.severity_level.NORMAL
@@ -150,18 +150,6 @@ def test_agent_env_and_the_create_only_key_field_read_back(
 
 
 @allure.feature(FEATURE)
-@allure.story("health reports the local client configuration")
-@allure.severity(NORMAL)
-def test_health_reports_the_local_client_configuration(test_client: AgentBoxClient):
-    with allure.step("1. health() answers from local configuration, with no request"):
-        health = test_client.health()
-        show("client.health()", method="test_client.health()", returns=health)
-        assert health["status"] == "ok"
-        assert health["baseUrl"] == test_client.base_url
-        assert health["authenticated"] is True
-
-
-@allure.feature(FEATURE)
 @allure.story("the session agent's image built")
 @allure.severity(NORMAL)
 def test_the_session_agent_builds_its_image(session_agent):
@@ -179,3 +167,45 @@ def test_the_session_agent_builds_its_image(session_agent):
         assert session_agent.template_build_status in (None, "ready")
         assert session_agent.template_build_error is None
         assert session_agent.launchable is True
+
+
+# --------------------------------------------------------------------------
+# Read-only rows, moved here from the old test_catalogue.py: they create
+# nothing, but they are agent calls. That file is now split in two, and neither
+# half takes them — test_catalog.py is idcs/products, test_client.py is
+# health()/eligibility().
+# --------------------------------------------------------------------------
+
+
+@allure.feature(FEATURE)
+@allure.story("agents.list returns a page")
+@allure.severity(NORMAL)
+def test_agents_list_returns_a_page(test_client: AgentBoxClient):
+    with allure.step("1. the page echoes the pagination it was asked for"):
+        page = test_client.agents.list(page=1, page_size=5)
+        show(
+            "client.agents.list(page=1, page_size=5)",
+            method="test_client.agents.list(page=1, page_size=5)",
+            returns=page,
+        )
+        assert page.page == 1
+        assert page.page_size == 5
+        assert len(page.items) <= 5
+        assert isinstance(page.total, int)
+
+
+@allure.feature(FEATURE)
+@allure.story("an unknown agent raises not found")
+@allure.severity(NORMAL)
+def test_unknown_agent_raises_not_found(test_client: AgentBoxClient):
+    """A slug that never existed, which is not the same case as the deleted
+    slug `test_agent_crud_round_trip` asks for."""
+    with allure.step("1. agents.get on a slug that does not exist answers 404"):
+        with pytest.raises(NotFoundError) as caught:
+            test_client.agents.get("sdk-test-does-not-exist-9d41f0")
+        show(
+            "client.agents.get('sdk-test-does-not-exist-9d41f0')",
+            method="test_client.agents.get('sdk-test-does-not-exist-9d41f0')",
+            returns=_payload(caught.value),
+        )
+        assert caught.value.status_code == 404

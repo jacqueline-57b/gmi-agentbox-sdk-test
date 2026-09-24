@@ -59,6 +59,18 @@ testing / traffic logging.
 Note: in `0.1.0b2`, `eligibility()` ends with an unreachable `return {...}`
 block (dead code copied from `health()`); it is harmless but present.
 
+**`health()` has no unhealthy answer.** Measured 2026-09-24 with `0.1.0b2`, on
+a client built with an unroutable `base_url` and a transport that raises on
+contact: it returns `{"status": "ok", "baseUrl": "https://example.invalid",
+"authenticated": true}` and records **zero requests**. Both flags are
+constants — `status` is the literal `"ok"`, and `authenticated` is
+`bool(self.api_key)` on a client that cannot exist without one, since
+`_require_api_key` raises `ValueError` on an empty or blank key before
+`__init__` returns. So the dict is byte-identical for a working key, for a key
+the service rejects with 401, and for a host that does not resolve. It is a
+constructor echo, not a readiness check; `eligibility()` is the cheapest call
+that actually answers either question. Covered by `tests/test_client.py`.
+
 ### Namespaces
 
 | Attribute | Class |
@@ -227,10 +239,15 @@ client.products.list(*, idc_name: Optional[str] = None,
 | `Idc` | `.idc_id` `.name` |
 | `Product` | `.instance_type` `.price` |
 
-> **Careful:** `eligibility().data_centers` and `idcs.list(runtime="sandbox")`
-> return different sets — on both production and staging the two have been
-> observed to be entirely disjoint. Select a data center from `idcs.list`, not
-> from `eligibility()`, or launches will fail.
+> **Careful:** the two answers to "where may this account launch" disagree, and
+> neither is a superset of the other. Measured 2026-09-24 on staging:
+> `eligibility().data_centers` returns seven names, all of them container
+> centers, and never `sandbox-runloop-us`; `idcs.list(runtime="sandbox")`
+> returns that one and nothing else; `idcs.list(runtime="container")` returns
+> six — it omits `asia-east-taiwan1`, which `eligibility()` lists and which does
+> sell four SKUs. Select a data center from `idcs.list(runtime=...)`, not from
+> `eligibility()`, and treat `runtime` as required: see
+> [the catalogue section](#the-catalogue-answers-per-runtime-and-omitting-runtime-means-container).
 
 ---
 
@@ -405,6 +422,61 @@ come from running the suite against `https://ce-tot.gmicloud-dev.com`
 (`idc` `sandbox-runloop-us`, `gmi.sandbox.x-small`, `docker.io/library/alpine:3.20`)
 on **2026-09-20** and **2026-09-23** with SDK `0.1.0b2`. Another deployment may
 answer differently — re-check before relying on any of it.
+
+### The catalogue answers per runtime, and omitting `runtime` means `container`
+
+`idcs.list` and `products.list` both take `runtime`, and `"sandbox"` is only one
+of its values. The set of values lives in `eligibility()`, in a field the
+`Eligibility` dataclass does not expose — read it off `.data`:
+
+```json
+{"runtimes": {"container": {"available": true}, "sandbox": {"available": true}}}
+```
+
+Each value is a different catalogue. Measured 2026-09-24 against staging with
+`0.1.0b2`:
+
+| call | `runtime="sandbox"` | `runtime="container"` | `runtime` omitted |
+|---|---|---|---|
+| `idcs.list(...)` | 1 center, `sandbox-runloop-us` | 6 centers | the same 6 |
+| `products.list(idc_name=<sandbox center>, ...)` | 5 SKUs, all priced 0 | `[]` | `[]` |
+| `products.list(idc_name=<container center>, ...)` | `[]` | that center's SKUs (1–4) | the same SKUs |
+| `products.list(...)`, no `idc_name` | **422** | 17 SKUs, every container center | the same 17 |
+| `products.list(idc_name="sdk-test-no-such-idc-9d41f0", ...)` | **404** `IDC not found: ...` | `[]` | `[]` |
+
+**Omitting `runtime` is not "every runtime", it is `container`.** The parameter
+is `Optional[str] = None` and `_compact`/`_query_url` drop a `None`, so the
+service picks: `idcs.list()` returns exactly `idcs.list(runtime="container")`,
+and `products.list(idc_name="sandbox-runloop-us")` — a real center, asked
+correctly except for the missing runtime — returns `[]`. A caller shopping for a
+sandbox who forgets the argument is told the center sells nothing, and is given
+no error to notice. `runtime=""` behaves the same way: the SDK does send it
+(`_query_url` only drops `None`), and the service reads it as absent.
+
+**The two runtimes do not even fail alike.** With no `idc_name`, the sandbox
+path is refused — `UnprocessableError` 422 wrapping an upstream 400,
+`Field validation for 'IDCName' failed on the 'required' tag` — while the
+container path happily returns the whole catalogue. With an `idc_name` that does
+not exist, the sandbox path answers 404 `IDC not found: <name>` and the container
+path answers 200 `[]`, which is indistinguishable from a real center that sells
+nothing. So "did I typo the data center?" is answerable on one runtime only.
+
+**Unknown values are rejected; loosely spelled ones are not.** `vm`, `gmi-ce`
+(the `deployment_type` the SDK derives for `runtime="sandbox"`, so the value a
+caller who confuses the two fields would send) and any other unknown string
+answer `UnprocessableError` 422 with `message` `runtime_invalid` — `code` is
+`null` again, so only the message separates a bad runtime from anything else.
+`"SANDBOX"`, `"Sandbox"` and `" sandbox "` are all accepted and return the
+sandbox listing, so case and surrounding whitespace are normalised before the
+match.
+
+**Nothing in the SDK names the valid values.** `runtime` is an unconstrained
+`Optional[str]` on both methods and on `agents.create`; the only enumeration the
+service offers is `eligibility().data["runtimes"]`, which no dataclass surfaces.
+
+Covered by `tests/test_catalog.py`, parametrized over both runtimes from
+`tests/helpers/catalogue.py`, with the tripwire that fails if `eligibility()`
+ever reports a third in `tests/test_client.py`.
 
 ### `launch()` has no idempotency and no "already running" signal
 
@@ -690,10 +762,12 @@ outside the Console.
 
 **The only lever is the runtime.** This account has exactly two (anything else
 answers `UnprocessableError: runtime_invalid`): `sandbox`, with one data center
-(`sandbox-runloop-us`) and SKUs priced at 0 in this environment, and
-`container`, with seven data centers and priced SKUs (`gmi.container.intel.*`,
-47500–100000). Whether a `container` task reports `logs: true` is **untested** —
-it is a different product path at a different price.
+(`sandbox-runloop-us`), five SKUs — `x-small`, `small`, `medium`, `large`,
+`x-large` — all priced 0 in this environment, and `container`, with six data
+centers in `idcs.list` (seven in `eligibility()`) and 17 priced SKUs
+(`gmi.container.intel.*` 47500–100000, `gmi.container.nv.*` up to 22000000).
+Whether a `container` task reports `logs: true` is **untested** — it is a
+different product path at a different price.
 
 ### Command output is capped at 1 MiB per stream, counted in bytes
 
@@ -951,6 +1025,154 @@ reached `running` normally.
 Note the shape depends on concurrency: fired one at a time the call is refused
 up front, while B-1 C-01 saw concurrent launches accepted with the rejection
 arriving later on the task. A caller has to handle both.
+
+### A colleague may not `upload` and may not `delete`, and may `execute`
+
+Measured 2026-09-23 with two keys issued to one organization (B-6 I-02),
+against a sandbox the first key created and the second had never touched.
+Membership was proved first: the second key enumerates the agent the first just
+created, so both really are inside one organization.
+
+Reads are open to the colleague, as expected:
+
+| call | result |
+|---|---|
+| `sandboxes.get(id)` | 200, the full record |
+| `sandboxes.list()` | 200, the owner's sandbox is in it |
+| `download_file("/tmp/i02.txt")` | 200, the owner's bytes |
+
+Writes are where it comes apart:
+
+```json
+{
+  "upload":  {"refused": true,  "status_code": 403, "message": "container_hub: forbidden"},
+  "delete":  {"refused": true,  "status_code": 403, "message": "container_hub: forbidden"},
+  "execute": {"refused": false, "returned": "exit_code 0, stdout 'colleague\n'"}
+}
+```
+
+`upload_file` and `delete` are refused 403 `container_hub: forbidden`, and the
+refusal is real — `/tmp/i02-colleague.txt` is absent from the sandbox
+afterwards, so nothing of the colleague's landed by that route. **`execute` on
+the same sandbox, with the same credential, is allowed.** The probe then wrote
+through it — `sandbox.execute("echo i02-bypass-923ef8 > /tmp/i02-bypass.txt")`
+— and the owner read `i02-bypass-923ef8` back out of the file. The upload the
+API had just refused was performed by the caller it refused, seconds later,
+through a call the same permission check lets past.
+
+**So the write boundary is drawn around two endpoints rather than around
+writing.** `execute` is the strongest of the three permissions — it can write
+any file, read any file, and kill anything running — and it is the one on the
+permissive side. A reviewer reading only the upload's 403 would conclude the
+boundary holds; it does not. Whatever check `container_hub` applies to the file
+and lifecycle routes is not applied to the execution route.
+
+`get` also returns `capabilities.shell: true` for the sandbox, so the colleague
+is told an interactive session exists as well.
+
+**What this does *not* establish is whether the refusal is about the role or
+about the ownership.** The sandbox record carries both `org_id` and `user_id`,
+and the colleague key is a different `user_id` inside the same `org_id`, so the
+403 has two readings that this measurement cannot separate: the member role
+holds no upload permission at all, or upload is scoped to whoever created the
+sandbox and the role is irrelevant. The deciding cell is the member uploading
+into a sandbox **the member created itself** — refused there too means the role
+lacks the permission; allowed there means I-02's 403 was only ever about whose
+sandbox it was.
+
+Nothing in the SDK can answer it directly. `AgentBoxClient` exposes exactly
+four namespaces — `agents`, `sandboxes`, `idcs`, `products` — and **no identity
+or role introspection of any kind**: no `me`, no `users`, no `organizations`,
+no key metadata. A caller cannot ask what role its own key holds, so role can
+only ever be inferred from behaviour, or read out of band from the console.
+What the member key demonstrably *does* hold is org-wide read: its
+`agents.list()` returns every agent in the organization, including ones other
+users created.
+
+### The edge blocks the SDK's own User-Agent, and the origin is down
+
+Measured 2026-09-24 against `https://ce-tot.gmicloud-dev.com`, with all three
+keys in this checkout. The SDK could not reach the API at all, and the failure
+arrives as a `PermissionDeniedError` that looks exactly like a dead credential:
+
+```
+agentbox_sdk.errors.PermissionDeniedError: Request failed   (403)
+```
+
+The body underneath is not from the API:
+
+```json
+{"title": "Error 1010: Access denied", "status": 403, "error_code": 1010,
+ "detail": "The site owner has blocked access based on your browser's signature."}
+```
+
+**Cloudflare rejects the request on its User-Agent, before the origin sees
+it.** `client._request_raw` sets only `Accept` and `Authorization`, so every
+call the SDK makes goes out as `Python-urllib/3.14` — which this WAF rule
+blocks. Sending any other UA (`curl/8.7.1`, a browser string) gets past the
+rule on the same URL with the same key, which isolates the cause to the header.
+
+Only the `Python-urllib` signature is refused. Re-measured later the same day,
+one request per UA, same URL and same key:
+
+| `User-Agent` | |
+|---|---|
+| `Python-urllib/3.14` | **403** `error code: 1010` |
+| *(header omitted entirely)* | 200 |
+| `curl/8.7.1` | 200 |
+| `python-requests/2.32.3` | 200 |
+| `agentbox-sdk/0.1.0b2` | 200 |
+
+So the rule matches the `Python-urllib` string itself, not "no browser" and not
+a missing header — which is why the SDK is the only caller that trips it.
+
+The separate origin outage recorded earlier in the day — every path answering
+**522 (connection timed out)** after ~20s — has since cleared: with an accepted
+UA, `GET /idcs?runtime=sandbox` answers 200 with
+`{"idcs":[{"idcId":"sandbox-runloop-us", ...}]}`. The 1010 rule is what remains,
+and on its own it is enough to fail every live row.
+
+**What did not clear: about one request in five never answers.** Measured later
+on 2026-09-24, 30 sequential `idcs.list(runtime="sandbox")` calls on one client
+with `timeout=10`: 24 answered in 0.3–7.4s, and **6 hung until the timeout**,
+scattered through the run rather than bunched — not a rate limit, since the
+fastest answers come straight after the hangs. At the SDK's default
+`timeout=30.0` the same hangs surface as `TimeoutError` out of `ssl.read`, which
+is not an `APIError` and so passes straight through every `except APIError`
+handler in the suite. Two consecutive runs of the whole of the catalogue file
+— around 30 read-only calls — gave 13 errors and then 1, with no code changed
+in between, and a third run of the single row that failed passed on its own.
+**A red row on this host is not evidence until it has been re-run**, and a
+session-scoped fixture that makes a live call takes every row that depends on
+it down with it.
+
+Re-measured later on 2026-09-24 on what is now `tests/test_catalog.py`, three
+runs of the same unchanged 19 rows: **1 failed + 18 errors** (146s), then
+**2 failed + 2 passed + 15 errors** (138s), then **19 passed** (31s). The
+cascade is the story — a single hung `eligibility()` errors every row behind
+the session fixture, so one lost request out of thirty reads as a file-wide
+failure, and the timing gives it away: a healthy run of that file is about 30s,
+a poisoned one about 140s, most of it spent in `ssl.read` waiting out the
+default `timeout=30.0`.
+
+The suite works around it in `tests/helpers/user_agent.py`: `install()`, called
+once from `tests/conftest.py`, replaces the SDK's module-level
+`urlopen_transport` / `urlopen_stream_transport` with wrappers that set
+`User-Agent: agentbox-sdk/<version> (gmi-sdk-test)`. It patches the name in
+both `agentbox_sdk._transport` and `agentbox_sdk.client`, because the client
+module binds the transports at import. Patching the fixture alone is not
+enough — the suite builds clients in about thirty places, most of them a bare
+`AgentBoxClient()`. The eight standalone scripts under `tests/test_b7_quickstart/`
+are deliberately left unpatched: they mirror the published quickstart, and as
+published it does not run against this host.
+
+Two consequences for anyone reading this suite's results. **A 403 from this SDK
+is not evidence of a permission decision** — 1010 and `container_hub:
+forbidden` are indistinguishable at the `APIError` level, and only the response
+body separates them, which the SDK discards (`message` is the generic `Request
+failed`). And **the SDK sends no product User-Agent at all**, so the API cannot
+identify its own client, rate-limit it separately, or exempt it from a rule
+like this one.
 
 ---
 
