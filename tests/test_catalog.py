@@ -16,15 +16,24 @@ and every catalogue call answers differently for each of them:
 |---|---|---|---|
 | `idcs.list(...)` | 1 center, `sandbox-runloop-us` | 6 centers | the same 6 |
 | `products.list(idc_name=<sandbox center>, ...)` | 5 SKUs, all priced 0 | `[]` | `[]` |
-| `products.list(idc_name=<container center>, ...)` | `[]` | that center's SKUs | the same SKUs |
+| `products.list(idc_name=<container center>, ...)` | `[]` (*) | that center's SKUs | the same SKUs |
 | `products.list(...)` with no center | **422**, `IDCName` required | the whole container catalogue | the same catalogue |
-| `products.list(idc_name="no-such-center", ...)` | **404** `IDC not found` | `[]` | `[]` |
+| `products.list(idc_name="no-such-center", ...)` | **404** `IDC not found` (*) | `[]` | `[]` |
 
 Read down the last column: omitting `runtime` is not "every runtime", it is
 `container`. A caller shopping for a sandbox who forgets it is handed an empty
 list rather than an error. Read across the last two rows: the two runtimes do
 not even fail alike — the sandbox path insists on a data center and checks that
 it exists, the container path does neither.
+
+(*) The two starred cells are the host's answer, not the SDK's, and production
+does not give the same one. There a sandbox listing for a center that is not a
+sandbox center is refused rather than answered `[]` — 422, wrapping an upstream
+400 `Parameter.Invalid`, `sandbox idc not configured: ...` for a real container
+center and `sandbox idc not found: ...` for a name that exists nowhere. The
+asymmetry the last two rows are about is the same on both hosts; only the shape
+of the sandbox side moves, so the two rows below assert the asymmetry and report
+the shape.
 
 A runtime the service does not know is refused with `UnprocessableError`, 422,
 `runtime_invalid` — but only after case and surrounding whitespace have been
@@ -373,27 +382,62 @@ def test_the_target_sandbox_sku_is_on_sale(test_client: AgentBoxClient, sandbox_
 def test_a_data_center_sells_nothing_under_another_runtime(
     test_client: AgentBoxClient, runtimes: Dict[str, Mapping], data_centers: Dict[str, List[Idc]]
 ):
-    """Asking the right center for the wrong runtime is empty, not an error."""
+    """Asking the right center for the wrong runtime sells nothing — but not the
+    same way on both runtimes, and not the same way on every host.
+
+    Measured 2026-09-24. Against staging both directions answer `[]`. Against
+    production the sandbox center asked for `"container"` still answers `[]`,
+    while the container center asked for `"sandbox"` is refused: 422, wrapping
+    an upstream 400 `Parameter.Invalid`, `sandbox idc not configured: idc
+    <name> provider route for sandbox is not configured`.
+
+    Nothing is sold either way, which is what this asserts; which of the two
+    shapes came back is reported rather than required, because it is the host
+    and not the SDK that decides. What is still required of a refusal is that
+    it be a 4xx naming the center asked about — a 500 or an expired key is not
+    this row passing.
+    """
     for runtime in RUNTIMES:
         require(runtime, runtimes)
 
     with allure.step("1. every center, asked for a runtime it does not serve"):
-        crossed = {}
+        asked = []
         for runtime in RUNTIMES:
             center = first_center(runtime, data_centers)
             for other in RUNTIMES:
                 if other == runtime:
                     continue
-                crossed[f"{center} asked for {other!r}"] = sorted(
-                    skus(test_client.products.list(idc_name=center, runtime=other))
-                )
+                asked.append((center, other, sold_or_refused(test_client, center, other)))
         show(
             "client.products.list(idc_name=<one runtime>, runtime=<another>)",
             method="test_client.products.list(idc_name=..., runtime=...)",
-            returns=crossed,
+            returns={
+                f"{center} asked for {other!r}": _payload(outcome) or "[] - empty, and no error"
+                for center, other, outcome in asked
+            },
         )
-        assert all(not found for found in crossed.values()), (
-            f"a data center answered for a runtime it does not serve: {crossed}"
+
+        sold = {
+            f"{center} asked for {other!r}": outcome
+            for center, other, outcome in asked
+            if not isinstance(outcome, APIError) and outcome
+        }
+        assert not sold, (
+            f"a data center answered for a runtime it does not serve: {sold}"
+        )
+
+        unrelated = {
+            f"{center} asked for {other!r}": _payload(outcome)
+            for center, other, outcome in asked
+            if isinstance(outcome, APIError)
+            and not (
+                400 <= (outcome.status_code or 0) < 500
+                and center in (outcome.message or "")
+            )
+        }
+        assert not unrelated, (
+            f"a cross-runtime listing was refused by something other than the "
+            f"center and runtime it was asked about: {unrelated}"
         )
 
 
@@ -485,34 +529,60 @@ def test_only_the_sandbox_catalogue_insists_on_a_data_center(
 
 
 @allure.feature(FEATURE)
-@allure.story("an unknown data center is a 404 only on the sandbox path")
+@allure.story("an unknown data center is refused only on the sandbox path")
 @allure.severity(NORMAL)
-def test_an_unknown_data_center_is_a_404_only_on_the_sandbox_path(
+def test_an_unknown_data_center_is_refused_only_on_the_sandbox_path(
     test_client: AgentBoxClient, runtimes: Dict[str, Mapping]
 ):
+    """One name that exists nowhere, put to both runtimes; only one looks.
+
+    Both calls are made in step 1, before either answer is judged. The row used
+    to open with `pytest.raises(NotFoundError)` around the sandbox call, so the
+    day that refusal changed shape the row stopped on its first line and the
+    container path — the half that carries the contrast the row is named after
+    — was never called and never reported. Whatever the sandbox path does now,
+    the container answer is in the report.
+
+    The refusal's status is the part that moves between hosts, measured
+    2026-09-24: staging answers 404 `IDC not found: <name>`, production answers
+    422 wrapping an upstream 400 `Parameter.Invalid`, `sandbox idc not found:
+    <name>`. Both name the center back. The container path names nothing,
+    because it never looked the name up.
+    """
     for runtime in RUNTIMES:
         require(runtime, runtimes)
 
-    with allure.step("1. the sandbox path says the data center does not exist"):
-        with pytest.raises(NotFoundError) as caught:
-            test_client.products.list(idc_name=NO_SUCH_IDC, runtime="sandbox")
+    with allure.step("1. both runtimes are asked for a center that does not exist"):
+        answers = {
+            runtime: sold_or_refused(test_client, NO_SUCH_IDC, runtime)
+            for runtime in ("sandbox", "container")
+        }
         show(
-            f"client.products.list(idc_name={NO_SUCH_IDC!r}, runtime='sandbox')",
-            method="test_client.products.list(idc_name=..., runtime='sandbox')",
+            f"client.products.list(idc_name={NO_SUCH_IDC!r}, runtime=...)",
+            method="test_client.products.list(idc_name=..., runtime=...)",
             args={"idc_name": NO_SUCH_IDC},
-            returns=_payload(caught.value),
+            returns={
+                f"runtime={runtime!r}": _payload(outcome) or "[] - empty, and no error"
+                for runtime, outcome in answers.items()
+            },
         )
-        assert caught.value.status_code == 404
-        assert NO_SUCH_IDC in (caught.value.message or "")
 
-    with allure.step("2. the container path answers as if the name were real"):
-        products = test_client.products.list(idc_name=NO_SUCH_IDC, runtime="container")
-        show(
-            f"client.products.list(idc_name={NO_SUCH_IDC!r}, runtime='container')",
-            method="test_client.products.list(idc_name=..., runtime='container')",
-            args={"idc_name": NO_SUCH_IDC},
-            returns=[product.data for product in products] or "[] - empty, and no error",
+    with allure.step("2. the sandbox path says the data center does not exist"):
+        refused = answers["sandbox"]
+        assert isinstance(refused, APIError), (
+            f"the sandbox path used to refuse a data center that does not exist; "
+            f"it now answers {refused}"
         )
-        assert not products, (
-            f"a data center that does not exist sold {sorted(skus(products))}"
+        # 404 on staging, 422 on production. Pinning either one fails on the
+        # other host, and both are the same answer: the name was looked up.
+        assert refused.status_code in (404, 422), _payload(refused)
+        assert NO_SUCH_IDC in (refused.message or ""), _payload(refused)
+
+    with allure.step("3. the container path answers as if the name were real"):
+        answer = answers["container"]
+        assert not isinstance(answer, APIError), (
+            f"the container path now refuses an unknown data center too, which "
+            f"makes the refusal above consistent rather than a sandbox-only "
+            f"rule: {_payload(answer)}"
         )
+        assert not answer, f"a data center that does not exist sold {answer}"

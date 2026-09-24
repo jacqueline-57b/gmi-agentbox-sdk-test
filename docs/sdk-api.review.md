@@ -444,6 +444,36 @@ Each value is a different catalogue. Measured 2026-09-24 against staging with
 | `products.list(...)`, no `idc_name` | **422** | 17 SKUs, every container center | the same 17 |
 | `products.list(idc_name="sdk-test-no-such-idc-9d41f0", ...)` | **404** `IDC not found: ...` | `[]` | `[]` |
 
+**The sandbox column is the host's answer, and production gives a different
+one.** The same matrix, measured 2026-09-24 against `https://console.gmicloud.ai`
+with `0.1.0b2`, differs in exactly the cells where the sandbox path meets a
+center it cannot use. Staging answers them; production refuses them:
+
+| call | staging | production |
+|---|---|---|
+| `idcs.list(runtime="sandbox")` | `sandbox-runloop-us` | `us-central-iowa2` |
+| `idcs.list(runtime="container")` | 6 centers | `us-central-iowa1` |
+| `products.list(idc_name=<container center>, runtime="sandbox")` | `[]` | **422** `sandbox idc not configured: idc us-central-iowa1 provider route for sandbox is not configured` |
+| `products.list(idc_name="sdk-test-no-such-idc-9d41f0", runtime="sandbox")` | **404** `IDC not found: ...` | **422** `sandbox idc not found: sdk-test-no-such-idc-9d41f0` |
+
+Both production refusals are `UnprocessableError` 422 wrapping an upstream 400
+whose body carries `"code":"Parameter.Invalid"` — the SDK's `.code` is `null`,
+as everywhere else here, so the upstream code is only readable out of the
+message string. Every other cell of the matrix agrees across the two hosts,
+including the whole `runtime="container"` column and the `runtime` omitted
+column.
+
+So the asymmetry below is real on both hosts, but **the status code is not
+something to match on**: a caller who writes `except NotFoundError` around a
+sandbox `products.list` catches the typo on staging and not in production.
+`except APIError` is the portable form.
+
+Also worth noting on production: `eligibility().dataCenters` is
+`["us-central-iowa1"]` — the container center only — while the sandbox center
+`us-central-iowa2` is reachable through `idcs.list(runtime="sandbox")` and sells
+five SKUs. That is the same "pick the center from `idcs.list`, not from
+`eligibility()`" trap the staging account shows, with different names in it.
+
 **Omitting `runtime` is not "every runtime", it is `container`.** The parameter
 is `Optional[str] = None` and `_compact`/`_query_url` drop a `None`, so the
 service picks: `idcs.list()` returns exactly `idcs.list(runtime="container")`,
@@ -457,8 +487,9 @@ no error to notice. `runtime=""` behaves the same way: the SDK does send it
 path is refused — `UnprocessableError` 422 wrapping an upstream 400,
 `Field validation for 'IDCName' failed on the 'required' tag` — while the
 container path happily returns the whole catalogue. With an `idc_name` that does
-not exist, the sandbox path answers 404 `IDC not found: <name>` and the container
-path answers 200 `[]`, which is indistinguishable from a real center that sells
+not exist, the sandbox path refuses — 404 `IDC not found: <name>` on staging,
+422 `sandbox idc not found: <name>` in production — and the container path
+answers 200 `[]`, which is indistinguishable from a real center that sells
 nothing. So "did I typo the data center?" is answerable on one runtime only.
 
 **Unknown values are rejected; loosely spelled ones are not.** `vm`, `gmi-ce`
